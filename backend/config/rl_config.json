@@ -1,0 +1,35 @@
+{
+  "rl": {
+    "grid_size": 8,
+    "force_levels": 5,
+    "min_force": 300.0,
+    "max_force": 1500.0,
+    "learning_rate": 0.01,
+    "gamma": 0.99,
+    "epsilon_start": 1.0,
+    "epsilon_min": 0.05,
+    "epsilon_decay": 0.995,
+    "target_thickness_um": 0.5
+  },
+  "reward": {
+    "uniformity_weight": 0.6,
+    "thickness_weight": 0.3,
+    "fracture_penalty_weight": 10.0,
+    "uniformity_scale": 100.0,
+    "thickness_error_scale": 50.0
+  },
+  "pretrain": {
+    "pretrain_lr": 0.05,
+    "pretrain_epochs": 50,
+    "pretrain_batch_size": 64,
+    "demo_buffer_capacity": 8000,
+    "num_demos": 20,
+    "steps_per_demo": 40,
+    "post_pretrain_epsilon": 0.3
+  },
+  "expert": {
+    "heuristic_noise_std": 0.01,
+    "candidate_topk_ratio": 0.95,
+    "uniform_threshold_ratio": 0.0001
+  }
+}

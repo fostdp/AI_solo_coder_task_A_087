@@ -1,0 +1,38 @@
+{
+  "material": {
+    "youngs_modulus": 79.0,
+    "poisson_ratio": 0.42,
+    "yield_strength": 120.0,
+    "ultimate_strength": 210.0,
+    "density": 19300.0,
+    "initial_thickness_um": 500.0,
+    "work_hardening_coeff": 0.45,
+    "work_hardening_exp": 0.35,
+    "recrystallization_temp": 200.0,
+    "melting_point": 1064.0
+  },
+  "hammer": {
+    "default_force": 500.0,
+    "default_radius_mm": 15.0,
+    "strike_duration_ms": 50.0,
+    "dynamic_load_factor": 180.0
+  },
+  "physics": {
+    "default_grid_size": 48,
+    "foil_size_mm": 150.0,
+    "thickness_reduction_temp_factor": 0.7,
+    "heat_generated_per_reduction": 150.0,
+    "thermal_diffusion_rate": 0.95,
+    "volume_correction_enabled": true
+  },
+  "remesh": {
+    "enable": true,
+    "check_interval_strikes": 8,
+    "min_grid_size": 32,
+    "max_grid_size": 128,
+    "gradient_threshold": 0.15,
+    "strain_gradient_threshold": 0.08,
+    "upscale_trigger_ratio": 0.08,
+    "downscale_trigger_ratio": 0.02
+  }
+}

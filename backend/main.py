@@ -1,10 +1,16 @@
 """
-金箔锻制工艺仿真系统 - FastAPI后端
-功能:
-  1. REST API - 锻制控制、数据查询、状态管理
-  2. WebSocket - 实时告警推送、状态更新
-  3. InfluxDB - 时序数据存储与查询
-  4. 静态文件服务 - 前端Three.js可视化
+金箔锻制工艺仿真系统 - FastAPI API网关
+基于模块化+Redis Pub/Sub架构重构
+
+模块划分:
+  - dtu_receiver:     传感器数据采集与校验
+  - plasticity_simulator: 塑性变形计算
+  - rl_optimizer_module:  强化学习路径优化
+  - alarm_ws:        告警评估与WebSocket推送
+
+通信方式:
+  - 同步路径: API直接调用模块方法 (性能优先)
+  - 异步路径: Redis Pub/Sub (解耦, 可独立部署)
 """
 import sys
 import os
@@ -34,16 +40,12 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from physics.physics_model import (
-    GoldFoilPhysicsModel,
-    HammerParameters,
-    MaterialProperties,
-)
-from rl.rl_optimizer import (
-    RLSession,
-    ActionType,
-    RLConfig,
-)
+from physics.physics_model import HammerParameters
+from modules.common import RedisBus, REDIS_CHANNELS, load_material_config, load_rl_config
+from modules.dtu_receiver import DtuReceiver
+from modules.plasticity_simulator import PlasticitySimulator
+from modules.rl_optimizer_module import RlOptimizerModule
+from modules.alarm_ws import AlarmWsService
 
 import influxdb_client
 from influxdb_client.client.write_api import SYNCHRONOUS
@@ -84,77 +86,43 @@ class SimulationConfig(BaseModel):
     target_thickness_um: float = Field(0.5, ge=0.05, le=50, description="目标厚度 (μm)")
 
 
-class ConnectionManager:
-    """WebSocket连接管理器"""
-    
-    def __init__(self):
-        self.active_connections: Dict[str, List[WebSocket]] = {}
-        self.all_connections: List[WebSocket] = []
-        self._lock = threading.Lock()
-    
-    async def connect(self, websocket: WebSocket, channel: str = "default"):
-        await websocket.accept()
-        with self._lock:
-            self.all_connections.append(websocket)
-            if channel not in self.active_connections:
-                self.active_connections[channel] = []
-            self.active_connections[channel].append(websocket)
-    
-    def disconnect(self, websocket: WebSocket):
-        with self._lock:
-            if websocket in self.all_connections:
-                self.all_connections.remove(websocket)
-            for channel in self.active_connections:
-                if websocket in self.active_connections[channel]:
-                    self.active_connections[channel].remove(websocket)
-    
-    async def broadcast(self, message: dict, channel: str = None):
-        if channel:
-            connections = self.active_connections.get(channel, [])
-        else:
-            connections = list(self.all_connections)
-        
-        disconnected = []
-        for conn in connections:
-            try:
-                await conn.send_json(message)
-            except Exception:
-                disconnected.append(conn)
-        
-        for conn in disconnected:
-            self.disconnect(conn)
+class GoldFoilSystem:
+    """系统总成 - 整合所有模块，提供统一API入口"""
 
-
-class GoldFoilService:
-    """金箔锻制服务 - 单例管理物理模型和强化学习会话"""
-    
     def __init__(self):
         self._lock = threading.Lock()
-        self.physics = None
-        self.rl_session = None
-        self.config = SimulationConfig()
-        self.foil_id = "NF-LIVE-001"
-        self.craftsman_id = "master_wu"
-        self.session_id = f"session-{int(time.time())}"
+
+        self.mat_config = load_material_config()
+        self.rl_config_raw = load_rl_config()
+
+        self.redis_bus = RedisBus()
+
+        self.dtu_receiver = DtuReceiver(self.redis_bus)
+        self.plasticity = PlasticitySimulator(self.redis_bus)
+        self.rl_optimizer = RlOptimizerModule(
+            self.redis_bus,
+            physics_model=self.plasticity.physics,
+        )
+        self.alarm_ws = AlarmWsService(self.redis_bus, threshold_um=FRACTURE_THRESHOLD_UM)
+
         self.strike_history: List[dict] = []
-        self.alert_history: List[dict] = []
         self.auto_sim_running = False
         self.auto_sim_thread = None
-        
+
+        self.foil_id = "NF-LIVE-001"
+        self.craftsman_id = "master_wu"
+        self.session_id = self.plasticity.session_id
+
         self._init_influxdb()
-        self.reset()
-    
+
     def _init_influxdb(self):
-        """初始化InfluxDB连接"""
         try:
             self.influx_client = influxdb_client.InfluxDBClient(
                 url=INFLUXDB_URL,
                 token=INFLUXDB_TOKEN,
                 org=INFLUXDB_ORG
             )
-            self.write_api = self.influx_client.write_api(
-                write_options=SYNCHRONOUS
-            )
+            self.write_api = self.influx_client.write_api(write_options=SYNCHRONOUS)
             self.query_api = self.influx_client.query_api()
             self.influxdb_available = True
         except Exception as e:
@@ -163,121 +131,53 @@ class GoldFoilService:
             self.influx_client = None
             self.write_api = None
             self.query_api = None
-    
-    def reset(self, config: SimulationConfig = None):
-        """重置仿真状态"""
+
+    def apply_manual_strike(self, hammer: HammerParameters) -> dict:
         with self._lock:
-            if config:
-                self.config = config
-            
-            material = MaterialProperties(
-                initial_thickness_um=self.config.initial_thickness_um,
-            )
-            self.physics = GoldFoilPhysicsModel(
-                grid_size=self.config.grid_size,
-                foil_size_mm=150.0,
-                material=material,
-            )
-            
-            rl_config = RLConfig(
-                grid_size=self.config.rl_grid_size,
-                force_levels=5,
-                min_force=300.0,
-                max_force=1200.0,
-                target_thickness_um=self.config.target_thickness_um,
-            )
-            self.rl_session = RLSession(
-                physics_model=self.physics,
-                config=rl_config,
-            )
-            
-            self.session_id = f"session-{int(time.time())}"
-            self.strike_history = []
-            self.alert_history = []
-            self.pretrain_running = False
-            self.pretrain_report = None
-    
-    def trigger_pretrain_async(
-        self,
-        num_demos: int = 20,
-        steps_per_demo: int = 40,
-        pretrain_epochs: int = 40,
-    ):
-        """在后台线程执行演示数据生成 + Behavior Cloning 预训练"""
-        if self.pretrain_running:
-            return {"running": True, "message": "预训练已在进行中"}
-        if self.rl_session and self.rl_session.policy.is_pretrained:
-            return {"running": False, "message": "已完成预训练", "report": self.pretrain_report}
-        
-        self.pretrain_running = True
-        
-        def worker():
-            try:
-                print("[RL] 开始后台预训练: 生成演示 + Behavior Cloning")
-                report = self.rl_session.generate_and_pretrain(
-                    num_demos=num_demos,
-                    steps_per_demo=steps_per_demo,
-                    pretrain_epochs=pretrain_epochs,
-                    verbose=True,
-                )
-                self.pretrain_report = report
-                print(f"[RL] 预训练完成! 位置准确率={report['behavior_cloning'].get('final_position_accuracy', 0):.2%}")
-            except Exception as e:
-                print(f"[RL] 预训练异常: {e}")
-            finally:
-                self.pretrain_running = False
-        
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
-        return {"running": True, "message": "预训练已启动，后台执行中"}
-    
-    def apply_strike(self, hammer: HammerParameters) -> dict:
-        """执行锤击并持久化数据"""
-        with self._lock:
-            result = self.physics.apply_hammer_strike(hammer)
-            thickness_data = self.physics.get_thickness_distribution()
-            fracture_risk = self.physics.check_fracture_risk(FRACTURE_THRESHOLD_UM)
-            
+            result = self.plasticity.apply_strike_direct(hammer)
+            thickness_data = self.plasticity.physics.get_thickness_distribution()
+            fracture_risk = self.plasticity.physics.check_fracture_risk(FRACTURE_THRESHOLD_UM)
+
             self._persist_strike(result, thickness_data, fracture_risk)
-            
+
             response = {
                 "strike": result,
                 "metrics": thickness_data["metrics"],
                 "fracture_risk": fracture_risk,
                 "timestamp": datetime.now().isoformat(),
             }
-            
-            self.strike_history.append(response)
-            if len(self.strike_history) > 1000:
-                self.strike_history = self.strike_history[-1000:]
-            
-            if fracture_risk["risk_level"] != "none":
-                alert = {
-                    "type": "fracture_warning",
-                    "level": fracture_risk["risk_level"],
-                    "message": f"厚度低于{FRACTURE_THRESHOLD_UM}μm，破裂风险：{fracture_risk['risk_level'].upper()}",
-                    "risk": fracture_risk,
-                    "timestamp": datetime.now().isoformat(),
-                }
-                self.alert_history.append(alert)
-                response["alert"] = alert
-            
+
+            self._record_and_check_alert(response, fracture_risk)
+
+            self.redis_bus.publish(REDIS_CHANNELS["strike_result"], {
+                "strike": result,
+                "foil_id": self.foil_id,
+                "session_id": self.session_id,
+                "timestamp": time.time(),
+            })
+            self.redis_bus.publish(REDIS_CHANNELS["thickness_updated"], {
+                "thickness_distribution": thickness_data,
+                "metrics": thickness_data["metrics"],
+                "timestamp": time.time(),
+            })
+
             return response
-    
-    def apply_rl_step(self, mode: ActionType = ActionType.HEURISTIC) -> dict:
-        """执行强化学习一步锤击"""
+
+    def apply_rl_strike(self, mode_str: str = "heuristic") -> dict:
         with self._lock:
-            action, strike_result, reward, fracture_risk = self.rl_session.step(mode=mode)
-            thickness_data = self.physics.get_thickness_distribution()
-            
+            action, strike_result, reward, fracture_risk = self.rl_optimizer.step_with_physics(
+                mode=self._resolve_action_type(mode_str)
+            )
+            thickness_data = self.plasticity.physics.get_thickness_distribution()
+
             self._persist_strike(
                 strike_result,
                 thickness_data,
                 fracture_risk,
                 rl_action=action,
-                rl_reward=reward
+                rl_reward=reward,
             )
-            
+
             response = {
                 "action": {
                     "force_N": action.force,
@@ -288,120 +188,52 @@ class GoldFoilService:
                 "metrics": thickness_data["metrics"],
                 "fracture_risk": fracture_risk,
                 "rl_reward": reward,
-                "rl_stats": self.rl_session.policy.get_policy_stats(),
+                "rl_stats": self.rl_optimizer.get_policy_stats(),
                 "timestamp": datetime.now().isoformat(),
             }
-            
-            self.strike_history.append(response)
-            
-            if fracture_risk["risk_level"] != "none":
-                alert = {
-                    "type": "fracture_warning",
-                    "level": fracture_risk["risk_level"],
-                    "message": f"厚度低于{FRACTURE_THRESHOLD_UM}μm，破裂风险：{fracture_risk['risk_level'].upper()}",
-                    "risk": fracture_risk,
-                    "timestamp": datetime.now().isoformat(),
-                }
-                self.alert_history.append(alert)
-                response["alert"] = alert
-            
-            return response
-    
-    def apply_annealing(self, temp_c: float, duration_min: float) -> dict:
-        """执行退火"""
-        with self._lock:
-            result = self.physics.apply_annealing(temp_c, duration_min)
-            return {
-                "annealing": result,
-                "metrics": self.physics.get_uniformity_metrics(),
-                "timestamp": datetime.now().isoformat(),
-            }
-    
-    def get_state(self) -> dict:
-        """获取当前状态"""
-        with self._lock:
-            thickness_data = self.physics.get_thickness_distribution()
-            fracture_risk = self.physics.check_fracture_risk(FRACTURE_THRESHOLD_UM)
-            
-            return {
+
+            self._record_and_check_alert(response, fracture_risk)
+
+            self.redis_bus.publish(REDIS_CHANNELS["strike_result"], {
+                "strike": strike_result,
+                "action": {"force_N": action.force, "position_mm": list(action.position)},
+                "rl_reward": reward,
                 "foil_id": self.foil_id,
                 "session_id": self.session_id,
-                "craftsman": self.craftsman_id,
-                "total_strikes": self.physics.strike_count,
-                "total_elongation": self.physics.total_elongation,
+                "timestamp": time.time(),
+            })
+            self.redis_bus.publish(REDIS_CHANNELS["thickness_updated"], {
                 "thickness_distribution": thickness_data,
-                "fracture_risk": fracture_risk,
-                "temperature_c": float(self.physics.temperature_c.mean()),
-                "plastic_strain": float(self.physics.plastic_strain.mean()),
-                "auto_sim_running": self.auto_sim_running,
-                "config": self.config.model_dump(),
-                "recent_alerts": self.alert_history[-20:],
-                "rl_stats": self.rl_session.policy.get_policy_stats() if self.rl_session else None,
+                "metrics": thickness_data["metrics"],
+                "timestamp": time.time(),
+            })
+
+            return response
+
+    def _record_and_check_alert(self, response: dict, fracture_risk: dict):
+        self.strike_history.append(response)
+        if len(self.strike_history) > 1000:
+            self.strike_history = self.strike_history[-1000:]
+
+        if fracture_risk["risk_level"] != "none":
+            alert = {
+                "type": "fracture_warning",
+                "level": fracture_risk["risk_level"],
+                "message": f"厚度低于{FRACTURE_THRESHOLD_UM}μm，破裂风险：{fracture_risk['risk_level'].upper()}",
+                "risk": fracture_risk,
+                "timestamp": datetime.now().isoformat(),
             }
-    
-    def get_thickness_visualization(self) -> dict:
-        """获取厚度可视化数据"""
-        with self._lock:
-            h = self.physics.thickness_um
-            h_norm = (h - h.min()) / (h.max() - h.min() + 1e-8)
-            
-            return {
-                "grid_size": self.physics.grid_size,
-                "foil_size_mm": self.physics.foil_size_mm,
-                "thickness_um": h.tolist(),
-                "normalized": h_norm.tolist(),
-                "min_um": float(h.min()),
-                "max_um": float(h.max()),
-                "mean_um": float(h.mean()),
-                "std_um": float(h.std()),
-            }
-    
-    def query_history(
-        self,
-        measurement: str = "forging_metrics",
-        window_minutes: int = 60,
-        limit: int = 1000,
-    ) -> list:
-        """从InfluxDB查询历史数据"""
-        if not self.influxdb_available:
-            return self.strike_history[-limit:]
-        
-        try:
-            start_time = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
-            flux_query = f'''
-                from(bucket: "{INFLUXDB_BUCKET}")
-                    |> range(start: {int(start_time.timestamp())}, stop: now())
-                    |> filter(fn: (r) => r._measurement == "{measurement}")
-                    |> filter(fn: (r) => r.foil_id == "{self.foil_id}")
-                    |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-                    |> sort(columns: ["_time"], desc: true)
-                    |> limit(n: {limit})
-            '''
-            result = self.query_api.query(flux_query)
-            
-            records = []
-            for table in result:
-                for record in table.records:
-                    records.append(record.values)
-            return records
-        except Exception as e:
-            print(f"[ERROR] 查询失败: {e}")
-            return self.strike_history[-limit:]
-    
-    def _persist_strike(
-        self,
-        strike_result: dict,
-        thickness_data: dict,
-        fracture_risk: dict,
-        rl_action=None,
-        rl_reward: float = 0.0,
-    ):
-        """持久化锤击数据到InfluxDB"""
+            self.alarm_ws.evaluator.alert_history.append(alert)
+            response["alert"] = alert
+            self.redis_bus.publish(REDIS_CHANNELS["alarm_triggered"], alert)
+
+    def _persist_strike(self, strike_result, thickness_data, fracture_risk,
+                       rl_action=None, rl_reward=0.0):
         if not self.influxdb_available or self.write_api is None:
             return
-        
+
         now = datetime.now(timezone.utc)
-        
+
         try:
             metrics_point = influxdb_client.Point("forging_metrics") \
                 .tag("foil_id", self.foil_id) \
@@ -416,7 +248,7 @@ class GoldFoilService:
                 .field("elongation_rate", strike_result["elongation_rate"]) \
                 .field("total_elongation", strike_result["total_elongation"]) \
                 .time(now)
-            
+
             uniformity = thickness_data["metrics"]
             uniform_point = influxdb_client.Point("uniformity_metrics") \
                 .tag("foil_id", self.foil_id) \
@@ -426,7 +258,7 @@ class GoldFoilService:
                 .field("uniformity_within_10pct", uniformity["uniformity_within_10pct"]) \
                 .field("range_ratio", uniformity["range_ratio"]) \
                 .time(now)
-            
+
             risk_point = influxdb_client.Point("fracture_risk") \
                 .tag("foil_id", self.foil_id) \
                 .tag("session_id", self.session_id) \
@@ -435,9 +267,9 @@ class GoldFoilService:
                 .field("risk_fraction", fracture_risk["risk_fraction"]) \
                 .field("min_thickness_um", fracture_risk["min_thickness_um"]) \
                 .time(now)
-            
+
             points = [metrics_point, uniform_point, risk_point]
-            
+
             if rl_action is not None:
                 rl_point = influxdb_client.Point("rl_optimization") \
                     .tag("foil_id", self.foil_id) \
@@ -448,20 +280,110 @@ class GoldFoilService:
                     .field("rl_action_y_mm", rl_action.position[1]) \
                     .time(now)
                 points.append(rl_point)
-            
-            self.write_api.write(
-                bucket=INFLUXDB_BUCKET,
-                org=INFLUXDB_ORG,
-                record=points
-            )
+
+            self.write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=points)
         except Exception as e:
             print(f"[WARN] 写入InfluxDB失败: {e}")
+
+    def apply_annealing(self, temp_c, duration_min) -> dict:
+        with self._lock:
+            result = self.plasticity.physics.apply_annealing(temp_c, duration_min)
+            self.redis_bus.publish(REDIS_CHANNELS["system_event"], {
+                "type": "anneal_complete",
+                "result": result,
+                "timestamp": time.time(),
+            })
+            return {
+                "annealing": result,
+                "metrics": self.plasticity.physics.get_uniformity_metrics(),
+                "timestamp": datetime.now().isoformat(),
+            }
+
+    def reset(self, config: SimulationConfig = None):
+        with self._lock:
+            self.plasticity.reset()
+            self.rl_optimizer.session.prev_metrics = None
+            self.rl_optimizer.session.prev_state = None
+            self.rl_optimizer.session.current_episode_reward = 0.0
+            self.rl_optimizer.session.step_count = 0
+            self.alarm_ws.evaluator.reset()
+
+            self.session_id = self.plasticity.session_id
+            self.strike_history = []
+
+            self.redis_bus.publish(REDIS_CHANNELS["system_event"], {
+                "type": "reset",
+                "session_id": self.session_id,
+                "timestamp": time.time(),
+            })
+
+    def get_state(self) -> dict:
+        with self._lock:
+            state = self.plasticity.get_state()
+            state["craftsman"] = self.craftsman_id
+            state["auto_sim_running"] = self.auto_sim_running
+            state["recent_alerts"] = self.alarm_ws.get_alert_history(20)
+            state["rl_stats"] = self.rl_optimizer.get_policy_stats()
+            return state
+
+    def get_thickness_viz(self) -> dict:
+        with self._lock:
+            return self.plasticity.get_thickness_viz()
+
+    def get_mesh_quality(self) -> dict:
+        with self._lock:
+            return self.plasticity.get_mesh_quality()
+
+    def trigger_pretrain_async(self, num_demos=20, steps_per_demo=40, pretrain_epochs=40):
+        return self.rl_optimizer.trigger_pretrain_async(
+            num_demos=num_demos,
+            steps_per_demo=steps_per_demo,
+            pretrain_epochs=pretrain_epochs,
+        )
+
+    def _resolve_action_type(self, mode: str):
+        from rl.rl_optimizer import ActionType
+        if mode == "pretrained":
+            if not self.rl_optimizer.session.policy.is_pretrained:
+                try:
+                    self.rl_optimizer.trigger_pretrain_async()
+                except Exception:
+                    pass
+            return ActionType.PRETRAINED
+        if mode == "rl":
+            return ActionType.Q_LEARNING
+        return ActionType.HEURISTIC
+
+    def query_history(self, measurement="forging_metrics", window_minutes=60, limit=1000):
+        if not self.influxdb_available:
+            return self.strike_history[-limit:]
+
+        try:
+            start_time = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+            flux_query = f'''
+                from(bucket: "{INFLUXDB_BUCKET}")
+                    |> range(start: {int(start_time.timestamp())}, stop: now())
+                    |> filter(fn: (r) => r._measurement == "{measurement}")
+                    |> filter(fn: (r) => r.foil_id == "{self.foil_id}")
+                    |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+                    |> sort(columns: ["_time"], desc: true)
+                    |> limit(n: {limit})
+            '''
+            result = self.query_api.query(flux_query)
+            records = []
+            for table in result:
+                for record in table.records:
+                    records.append(record.values)
+            return records
+        except Exception as e:
+            print(f"[ERROR] 查询失败: {e}")
+            return self.strike_history[-limit:]
 
 
 app = FastAPI(
     title="金箔锻制工艺仿真与厚度均匀性分析系统",
-    description="基于塑性力学与强化学习的南京金箔锻制工艺研究平台",
-    version="1.0.0",
+    description="基于塑性力学与强化学习的南京金箔锻制工艺研究平台 (v3 模块化架构)",
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -472,12 +394,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-service = GoldFoilService()
-ws_manager = ConnectionManager()
+system = GoldFoilSystem()
 
 
-def get_service():
-    return service
+def get_system():
+    return system
 
 
 @app.get("/api/health")
@@ -485,35 +406,38 @@ async def health_check():
     """健康检查"""
     return {
         "status": "ok",
+        "version": "3.0.0",
+        "architecture": "modular-redis-pubsub",
         "timestamp": datetime.now().isoformat(),
-        "influxdb": "connected" if service.influxdb_available else "disconnected",
-        "active_ws_connections": len(ws_manager.all_connections),
+        "influxdb": "connected" if system.influxdb_available else "disconnected",
+        "redis": "connected" if system.redis_bus.available else "memory_mode",
+        "active_ws_connections": system.alarm_ws.connection_count(),
     }
 
 
 @app.get("/api/state")
 async def get_system_state():
     """获取完整系统状态"""
-    return service.get_state()
+    return system.get_state()
 
 
 @app.get("/api/visualization/thickness")
 async def get_thickness_viz():
     """获取厚度可视化数据"""
-    return service.get_thickness_visualization()
+    return system.get_thickness_viz()
 
 
 @app.get("/api/metrics/uniformity")
 async def get_uniformity_metrics():
     """获取均匀性指标"""
-    state = service.get_state()
+    state = system.get_state()
     return state["thickness_distribution"]["metrics"]
 
 
 @app.get("/api/risk/fracture")
 async def get_fracture_risk():
     """获取破裂风险"""
-    return service.get_state()["fracture_risk"]
+    return system.get_state()["fracture_risk"]
 
 
 @app.post("/api/strike")
@@ -524,33 +448,20 @@ async def apply_hammer_strike(req: HammerRequest):
         position=(req.position_x_mm, req.position_y_mm),
         radius_mm=req.radius_mm,
     )
-    result = service.apply_strike(hammer)
-    
+    result = system.apply_manual_strike(hammer)
+
     if "alert" in result:
-        await ws_manager.broadcast({
+        await system.alarm_ws.ws_manager.broadcast({
             "channel": "alerts",
             "data": result["alert"]
         }, channel="alerts")
-    
-    await ws_manager.broadcast({
+
+    await system.alarm_ws.ws_manager.broadcast({
         "channel": "state_update",
         "data": result
     })
-    
+
     return result
-
-
-def _resolve_action_type(mode: StrikeMode) -> ActionType:
-    if mode == StrikeMode.PRETRAINED:
-        if service.rl_session and not service.rl_session.policy.is_pretrained:
-            try:
-                service.trigger_pretrain_async()
-            except Exception:
-                pass
-        return ActionType.PRETRAINED
-    if mode == StrikeMode.RL:
-        return ActionType.Q_LEARNING
-    return ActionType.HEURISTIC
 
 
 @app.post("/api/strike/auto")
@@ -558,28 +469,27 @@ async def apply_auto_strike(
     mode: StrikeMode = Query(StrikeMode.HEURISTIC, description="锤击模式"),
 ):
     """自动锤击一步（启发式/强化学习/预训练策略）"""
-    action_type = _resolve_action_type(mode)
-    result = service.apply_rl_step(mode=action_type)
-    
+    result = system.apply_rl_strike(mode_str=mode.value)
+
     if "alert" in result:
-        await ws_manager.broadcast({
+        await system.alarm_ws.ws_manager.broadcast({
             "channel": "alerts",
             "data": result["alert"]
         }, channel="alerts")
-    
-    await ws_manager.broadcast({
+
+    await system.alarm_ws.ws_manager.broadcast({
         "channel": "state_update",
         "data": result
     })
-    
+
     return result
 
 
 @app.post("/api/anneal")
 async def perform_annealing(req: AnnealRequest):
     """执行退火处理"""
-    result = service.apply_annealing(req.temperature_c, req.duration_min)
-    await ws_manager.broadcast({
+    result = system.apply_annealing(req.temperature_c, req.duration_min)
+    await system.alarm_ws.ws_manager.broadcast({
         "channel": "state_update",
         "data": {"event": "annealing", **result}
     })
@@ -589,12 +499,12 @@ async def perform_annealing(req: AnnealRequest):
 @app.post("/api/reset")
 async def reset_simulation(config: Optional[SimulationConfig] = None):
     """重置仿真"""
-    service.reset(config)
+    system.reset(config)
     result = {
         "message": "仿真已重置",
-        "state": service.get_state()
+        "state": system.get_state()
     }
-    await ws_manager.broadcast({
+    await system.alarm_ws.ws_manager.broadcast({
         "channel": "state_update",
         "data": {"event": "reset", **result}
     })
@@ -608,13 +518,13 @@ async def get_history(
     limit: int = Query(500, ge=1, le=5000, description="返回条数"),
 ):
     """查询历史数据"""
-    return service.query_history(measurement, window_minutes, limit)
+    return system.query_history(measurement, window_minutes, limit)
 
 
 @app.get("/api/alerts")
 async def get_alerts(limit: int = Query(50, ge=1, le=500)):
     """获取告警历史"""
-    return service.alert_history[-limit:]
+    return system.alarm_ws.get_alert_history(limit)
 
 
 @app.post("/api/simulation/auto/start")
@@ -624,51 +534,50 @@ async def start_auto_simulation(
     mode: StrikeMode = Query(StrikeMode.HEURISTIC, description="锤击模式"),
 ):
     """启动自动仿真循环"""
-    if service.auto_sim_running:
+    if system.auto_sim_running:
         raise HTTPException(status_code=400, detail="自动仿真已在运行")
-    
-    service.auto_sim_running = True
-    action_type = _resolve_action_type(mode)
-    
+
+    system.auto_sim_running = True
+
     def sim_loop():
         count = 0
         try:
-            while service.auto_sim_running:
+            while system.auto_sim_running:
                 if max_strikes and count >= max_strikes:
                     break
-                
-                result = service.apply_rl_step(mode=action_type)
-                
+
+                result = system.apply_rl_strike(mode_str=mode.value)
+
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
                     if "alert" in result:
-                        loop.run_until_complete(ws_manager.broadcast({
+                        loop.run_until_complete(system.alarm_ws.ws_manager.broadcast({
                             "channel": "alerts",
                             "data": result["alert"]
                         }, channel="alerts"))
-                    
-                    loop.run_until_complete(ws_manager.broadcast({
+
+                    loop.run_until_complete(system.alarm_ws.ws_manager.broadcast({
                         "channel": "state_update",
                         "data": result
                     }))
                 finally:
                     loop.close()
-                
+
                 if result["fracture_risk"]["risk_level"] == "high":
                     time.sleep(2)
-                
+
                 if result["metrics"]["mean_thickness_um"] < 0.12:
                     break
-                
+
                 time.sleep(interval_sec)
                 count += 1
         finally:
-            service.auto_sim_running = False
-    
-    service.auto_sim_thread = threading.Thread(target=sim_loop, daemon=True)
-    service.auto_sim_thread.start()
-    
+            system.auto_sim_running = False
+
+    system.auto_sim_thread = threading.Thread(target=sim_loop, daemon=True)
+    system.auto_sim_thread.start()
+
     return {
         "message": "自动仿真已启动",
         "interval_sec": interval_sec,
@@ -680,23 +589,24 @@ async def start_auto_simulation(
 @app.post("/api/simulation/auto/stop")
 async def stop_auto_simulation():
     """停止自动仿真"""
-    if not service.auto_sim_running:
+    if not system.auto_sim_running:
         raise HTTPException(status_code=400, detail="自动仿真未在运行")
-    
-    service.auto_sim_running = False
-    if service.auto_sim_thread:
-        service.auto_sim_thread.join(timeout=2)
-    
+
+    system.auto_sim_running = False
+    if system.auto_sim_thread:
+        system.auto_sim_thread.join(timeout=2)
+
     return {"message": "自动仿真已停止"}
 
 
 @app.get("/api/stats/summary")
 async def get_stats_summary():
     """统计摘要"""
-    state = service.get_state()
+    state = system.get_state()
     metrics = state["thickness_distribution"]["metrics"]
     risk = state["fracture_risk"]
-    
+    rl_stats = state.get("rl_stats", {})
+
     return {
         "total_strikes": state["total_strikes"],
         "total_elongation": state["total_elongation"],
@@ -704,7 +614,7 @@ async def get_stats_summary():
             "mean_um": metrics["mean_thickness_um"],
             "std_um": metrics["std_thickness_um"],
             "cv": metrics["coefficient_of_variation"],
-            "grid_size": metrics.get("grid_size", service.config.grid_size),
+            "grid_size": metrics.get("grid_size", state.get("grid_size", 48)),
         },
         "uniformity": {
             "within_5pct": metrics["uniformity_within_5pct"],
@@ -713,12 +623,12 @@ async def get_stats_summary():
         "fracture_risk": risk,
         "temperature_c": state["temperature_c"],
         "plastic_strain": state["plastic_strain"],
-        "alerts_count": len(service.alert_history),
+        "alerts_count": len(system.alarm_ws.get_alert_history()),
         "in_progress": state["auto_sim_running"],
         "pretrain": {
-            "running": getattr(service, "pretrain_running", False),
-            "report": getattr(service, "pretrain_report", None),
-            "is_pretrained": service.rl_session.policy.is_pretrained if service.rl_session else False,
+            "running": rl_stats.get("pretrain_running", False),
+            "report": rl_stats.get("pretrain_report"),
+            "is_pretrained": rl_stats.get("is_pretrained", False),
         },
     }
 
@@ -729,8 +639,8 @@ async def trigger_pretrain(
     steps_per_demo: int = Query(40, ge=10, le=100, description="每集步数"),
     pretrain_epochs: int = Query(50, ge=10, le=200, description="训练轮数"),
 ):
-    """启动强化学习预训练（演示数据生成 + Behavior Cloning）"""
-    result = service.trigger_pretrain_async(
+    """启动强化学习预训练"""
+    result = system.trigger_pretrain_async(
         num_demos=num_demos,
         steps_per_demo=steps_per_demo,
         pretrain_epochs=pretrain_epochs,
@@ -741,8 +651,7 @@ async def trigger_pretrain(
 @app.get("/api/mesh/quality")
 async def get_mesh_quality():
     """自适应网格重划 - 质量诊断报告"""
-    with service._lock:
-        return service.physics.get_mesh_quality_report()
+    return system.get_mesh_quality()
 
 
 @app.websocket("/ws")
@@ -751,48 +660,8 @@ async def websocket_endpoint(
     channel: str = Query("default", description="订阅频道: default/alerts/state"),
 ):
     """WebSocket实时推送"""
-    await ws_manager.connect(websocket, channel)
-    try:
-        await websocket.send_json({
-            "type": "connected",
-            "channel": channel,
-            "timestamp": datetime.now().isoformat(),
-        })
-        
-        await websocket.send_json({
-            "channel": "state_update",
-            "data": service.get_state()
-        })
-        
-        while True:
-            data = await websocket.receive_text()
-            try:
-                msg = json.loads(data)
-                msg_type = msg.get("type", "")
-                
-                if msg_type == "get_state":
-                    await websocket.send_json({
-                        "channel": "state_update",
-                        "data": service.get_state()
-                    })
-                elif msg_type == "get_thickness":
-                    await websocket.send_json({
-                        "channel": "thickness_viz",
-                        "data": service.get_thickness_visualization()
-                    })
-                elif msg_type == "ping":
-                    await websocket.send_json({
-                        "type": "pong",
-                        "timestamp": datetime.now().isoformat()
-                    })
-            except json.JSONDecodeError:
-                pass
-            
-    except WebSocketDisconnect:
-        ws_manager.disconnect(websocket)
-    except Exception as e:
-        print(f"[WS] 连接异常: {e}")
-        ws_manager.disconnect(websocket)
+    initial_state = system.get_state()
+    await system.alarm_ws.handle_websocket(websocket, channel, initial_state)
 
 
 @app.get("/")
@@ -803,9 +672,10 @@ async def read_root():
         return FileResponse(index_path)
     return {
         "name": "金箔锻制工艺仿真系统 API",
-        "version": "1.0.0",
+        "version": "3.0.0",
+        "architecture": "modular + redis pub/sub",
         "docs": "/docs",
-        "frontend_warning": "前端页面未找到，请启动前端服务器或构建",
+        "modules": ["dtu_receiver", "plasticity_simulator", "rl_optimizer", "alarm_ws"],
     }
 
 
@@ -818,14 +688,16 @@ if os.path.exists(FRONTEND_DIR):
 
 if __name__ == "__main__":
     import uvicorn
-    print("="*60)
-    print("  金箔锻制工艺仿真与厚度均匀性分析系统")
-    print("  南京金箔锻制工艺数字化研究平台")
-    print("="*60)
+    print("=" * 60)
+    print("  金箔锻制工艺仿真与厚度均匀性分析系统 v3")
+    print("  模块化架构 + Redis Pub/Sub")
+    print("=" * 60)
+    print(f"  模块: dtu_receiver | plasticity_simulator | rl_optimizer | alarm_ws")
     print(f"  API 文档: http://localhost:8000/docs")
     print(f"  WebSocket: ws://localhost:8000/ws")
-    print(f"  InfluxDB:  {INFLUXDB_URL}")
+    print(f"  Redis:  {'连接' if system.redis_bus.available else '内存模式降级'}")
+    print(f"  InfluxDB: {'连接' if system.influxdb_available else '未连接'}")
     print(f"  破裂阈值: {FRACTURE_THRESHOLD_UM}μm")
-    print("="*60)
-    
+    print("=" * 60)
+
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
