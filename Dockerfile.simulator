@@ -1,0 +1,51 @@
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential gcc g++ libopenblas-dev pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt
+
+
+FROM python:3.11-slim AS runtime
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libgomp1 libopenblas0 curl && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /wheels /wheels
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt && \
+    rm -rf /wheels
+
+COPY backend/ ./backend/
+COPY scripts/ ./scripts/
+
+WORKDIR /app
+
+RUN groupadd -r simuser && useradd -r -g simuser simuser && \
+    chown -R simuser:simuser /app
+
+USER simuser
+
+ENV INFLUXDB_URL=${INFLUXDB_URL:-http://influxdb:8086}
+ENV INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-gold-foil-simulation-token}
+ENV INFLUXDB_ORG=${INFLUXDB_ORG:-craftsman-research}
+ENV INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-gold-foil-data}
+
+ENTRYPOINT ["python", "scripts/simulator.py"]
+CMD ["--preset", "nanjing_wujin"]

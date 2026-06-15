@@ -1,0 +1,140 @@
+services:
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: gold-foil-redis
+    restart: unless-stopped
+    command: >
+      redis-server --appendonly yes --appendfsync everysec
+      --maxmemory 256mb --maxmemory-policy allkeys-lru
+      --save 60 1000 --save 300 100
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - gold-foil-net
+
+  influxdb:
+    image: influxdb:2.7-alpine
+    container_name: gold-foil-influxdb
+    restart: unless-stopped
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUXDB_USER:-admin}
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUXDB_PASS:-gold-foil-admin-pass}
+      DOCKER_INFLUXDB_INIT_ORG: ${INFLUXDB_ORG:-craftsman-research}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUXDB_BUCKET:-gold-foil-data}
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_TOKEN:-gold-foil-simulation-token}
+      INFLUXDB_REPORTING_DISABLED: "true"
+      INFLUXDB_HTTP_FLUX_ENABLED: "true"
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+      - influxdb_config:/etc/influxdb2
+    ports:
+      - "${INFLUXDB_PORT:-8086}:8086"
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    networks:
+      - gold-foil-net
+
+  influxdb-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: gold-foil-influxdb-init
+    command: python scripts/init_influxdb.py
+    working_dir: /app
+    environment:
+      INFLUXDB_URL: http://influxdb:8086
+      INFLUXDB_USER: ${INFLUXDB_USER:-admin}
+      INFLUXDB_PASS: ${INFLUXDB_PASS:-gold-foil-admin-pass}
+      INFLUXDB_ORG: ${INFLUXDB_ORG:-craftsman-research}
+      INFLUXDB_BUCKET: ${INFLUXDB_BUCKET:-gold-foil-data}
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-gold-foil-simulation-token}
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    networks:
+      - gold-foil-net
+    restart: "no"
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: gold-foil-backend
+    restart: unless-stopped
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      INFLUXDB_URL: http://influxdb:8086
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-gold-foil-simulation-token}
+      INFLUXDB_ORG: ${INFLUXDB_ORG:-craftsman-research}
+      INFLUXDB_BUCKET: ${INFLUXDB_BUCKET:-gold-foil-data}
+      GUNICORN_WORKERS: ${BACKEND_WORKERS:-4}
+      GUNICORN_TIMEOUT: "90"
+      GUNICORN_KEEPALIVE: "10"
+      GUNICORN_MAX_REQUESTS: "50000"
+      FRONTEND_STATIC: "true"
+    volumes:
+      - ./backend/config:/app/backend/config:ro
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      influxdb-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - gold-foil-net
+
+  simulator:
+    build:
+      context: .
+      dockerfile: Dockerfile.simulator
+    container_name: gold-foil-simulator
+    restart: "no"
+    environment:
+      INFLUXDB_URL: http://influxdb:8086
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-gold-foil-simulation-token}
+      INFLUXDB_ORG: ${INFLUXDB_ORG:-craftsman-research}
+      INFLUXDB_BUCKET: ${INFLUXDB_BUCKET:-gold-foil-data}
+      FOIL_ID: ${SIM_FOIL_ID:-NF-DOCKER-001}
+      CRAFTSMAN_ID: ${SIM_CRAFTSMAN_ID:-master_wu}
+      REPORT_INTERVAL: ${SIM_REPORT_INTERVAL:-60}
+    command: ${SIM_COMMAND}
+    depends_on:
+      redis:
+        condition: service_healthy
+      influxdb-init:
+        condition: service_completed_successfully
+      backend:
+        condition: service_healthy
+    networks:
+      - gold-foil-net
+    profiles:
+      - simulator
+
+volumes:
+  redis_data:
+  influxdb_data:
+  influxdb_config:
+
+networks:
+  gold-foil-net:
+    driver: bridge

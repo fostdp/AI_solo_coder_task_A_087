@@ -1,0 +1,68 @@
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        gcc \
+        g++ \
+        libopenblas-dev \
+        pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+
+RUN pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt
+
+
+FROM python:3.11-slim AS runtime
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libgomp1 \
+        libopenblas0 \
+        curl && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /wheels /wheels
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt && \
+    rm -rf /wheels
+
+COPY backend/ ./backend/
+
+WORKDIR /app/backend
+
+RUN groupadd -r appuser && useradd -r -g appuser appuser && \
+    chown -R appuser:appuser /app
+
+USER appuser
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8000/api/health || exit 1
+
+ENV GUNICORN_WORKERS=4 \
+    GUNICORN_WORKER_CLASS=uvicorn.workers.UvicornWorker \
+    GUNICORN_BIND=0.0.0.0:8000 \
+    GUNICORN_LOGLEVEL=info \
+    GUNICORN_TIMEOUT=60 \
+    GUNICORN_KEEPALIVE=5 \
+    GUNICORN_PRELOAD=false \
+    GUNICORN_MAX_REQUESTS=10000
+
+CMD ["gunicorn", "main:app", "-c", "gunicorn_conf.py"]
