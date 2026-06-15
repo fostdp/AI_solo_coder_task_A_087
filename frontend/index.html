@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>金箔锻制工艺仿真与厚度均匀性分析系统</title>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/examples/js/controls/OrbitControls.js"></script>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="app-container">
+        <header class="app-header">
+            <div class="header-title">
+                <h1>🏺 金箔锻制工艺仿真与厚度均匀性分析系统</h1>
+                <p class="subtitle">南京金箔锻制工艺数字化研究平台 | 基于塑性力学 & 强化学习</p>
+            </div>
+            <div class="header-status">
+                <span id="connection-status" class="status-badge status-connecting">连接中...</span>
+                <span id="influx-status" class="status-badge status-unknown">InfluxDB: 未知</span>
+            </div>
+        </header>
+
+        <div class="main-content">
+            <aside class="sidebar-left">
+                <div class="panel">
+                    <h3>📊 实时指标</h3>
+                    <div class="metrics-grid">
+                        <div class="metric-card">
+                            <div class="metric-label">锤击次数</div>
+                            <div class="metric-value" id="metric-strikes">0</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-label">平均厚度</div>
+                            <div class="metric-value" id="metric-thickness">500.00 μm</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-label">变异系数 CV</div>
+                            <div class="metric-value" id="metric-cv">0.0000</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-label">延展率</div>
+                            <div class="metric-value" id="metric-elongation">1.00x</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-label">温度</div>
+                            <div class="metric-value" id="metric-temp">25.0°C</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-label">塑性应变</div>
+                            <div class="metric-value" id="metric-strain">0.000</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <h3>⚠️ 破裂风险</h3>
+                    <div id="risk-indicator" class="risk-level risk-none">
+                        <div class="risk-title">无风险</div>
+                        <div class="risk-detail" id="risk-detail">厚度正常</div>
+                    </div>
+                    <div class="uniformity-bar">
+                        <div class="bar-label">±10% 均匀率</div>
+                        <div class="bar-container">
+                            <div class="bar-fill" id="uniformity-fill" style="width: 100%;"></div>
+                        </div>
+                        <div class="bar-value" id="uniformity-value">100.0%</div>
+                    </div>
+                    <div class="thickness-range">
+                        <div class="range-item">
+                            <span>最薄</span>
+                            <span id="thickness-min">500 μm</span>
+                        </div>
+                        <div class="range-item">
+                            <span>最厚</span>
+                            <span id="thickness-max">500 μm</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <h3>🔧 控制面板</h3>
+                    <div class="control-group">
+                        <label>锤击模式</label>
+                        <select id="strike-mode">
+                            <option value="heuristic">启发式（乌兹经验）</option>
+                            <option value="rl">强化学习优化</option>
+                            <option value="manual">手动控制</option>
+                        </select>
+                    </div>
+                    
+                    <div id="manual-controls" style="display:none;">
+                        <div class="control-group">
+                            <label>力度: <span id="force-label">800</span> N</label>
+                            <input type="range" id="force-slider" min="300" max="1500" value="800" step="50">
+                        </div>
+                        <div class="control-group">
+                            <label>X坐标: <span id="posx-label">0</span> mm</label>
+                            <input type="range" id="posx-slider" min="-70" max="70" value="0" step="1">
+                        </div>
+                        <div class="control-group">
+                            <label>Y坐标: <span id="posy-label">0</span> mm</label>
+                            <input type="range" id="posy-slider" min="-70" max="70" value="0" step="1">
+                        </div>
+                    </div>
+
+                    <div class="btn-group">
+                        <button id="btn-strike" class="btn btn-primary">单次锤击</button>
+                        <button id="btn-auto" class="btn btn-success">▶ 自动锻制</button>
+                        <button id="btn-stop" class="btn btn-danger" style="display:none;">■ 停止</button>
+                    </div>
+                    
+                    <div class="control-group">
+                        <label>间隔: <span id="interval-label">1.0</span>s</label>
+                        <input type="range" id="interval-slider" min="0.1" max="3" value="1" step="0.1">
+                    </div>
+
+                    <hr>
+                    <div class="control-group">
+                        <label>退火温度: <span id="anneal-temp-label">450</span>°C</label>
+                        <input type="range" id="anneal-temp" min="200" max="800" value="450" step="25">
+                    </div>
+                    <button id="btn-anneal" class="btn btn-warning">🔥 退火处理</button>
+                    <button id="btn-reset" class="btn btn-secondary">↺ 重置</button>
+                </div>
+            </aside>
+
+            <main class="center-content">
+                <div class="viz-panel">
+                    <div class="viz-header">
+                        <h3>🎭 金箔锻打三维动画</h3>
+                        <div class="viz-controls">
+                            <label><input type="checkbox" id="toggle-wireframe"> 线框</label>
+                            <label><input type="checkbox" id="toggle-color" checked> 色云图</label>
+                            <label><input type="checkbox" id="toggle-auto-rotate"> 自动旋转</label>
+                        </div>
+                    </div>
+                    <div id="three-container" class="three-canvas"></div>
+                    <div class="color-legend">
+                        <span>薄 (冷色)</span>
+                        <div class="legend-bar">
+                            <div class="legend-gradient"></div>
+                        </div>
+                        <span>厚 (暖色)</span>
+                        <span class="legend-value" id="legend-min">500</span>
+                        <span class="legend-value" id="legend-max">500</span>
+                    </div>
+                </div>
+
+                <div class="viz-panel">
+                    <div class="viz-header">
+                        <h3>🌡️ 厚度分布云图 (Canvas)</h3>
+                        <div class="viz-controls">
+                            <select id="colormap-select">
+                                <option value="viridis">Viridis</option>
+                                <option value="turbo">Turbo</option>
+                                <option value="jet">Jet</option>
+                                <option value="thermal">Thermal</option>
+                            </select>
+                        </div>
+                    </div>
+                    <canvas id="heatmap-canvas" class="heatmap-canvas"></canvas>
+                    <div id="canvas-tooltip" class="canvas-tooltip" style="display:none;"></div>
+                </div>
+            </main>
+
+            <aside class="sidebar-right">
+                <div class="panel">
+                    <h3>📋 告警日志</h3>
+                    <div id="alerts-log" class="alerts-log">
+                        <div class="log-empty">暂无告警</div>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <h3>📜 锤击历史</h3>
+                    <div id="strike-history" class="strike-history">
+                        <div class="log-empty">等待锤击...</div>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <h3>📈 趋势指标</h3>
+                    <div class="trend-grid">
+                        <div class="trend-item">
+                            <span>RL奖励</span>
+                            <span id="trend-reward">0.00</span>
+                        </div>
+                        <div class="trend-item">
+                            <span>探索率 ε</span>
+                            <span id="trend-epsilon">1.00</span>
+                        </div>
+                        <div class="trend-item">
+                            <span>±5%均匀率</span>
+                            <span id="trend-u5">100%</span>
+                        </div>
+                        <div class="trend-item">
+                            <span>极差/均值比</span>
+                            <span id="trend-range">0%</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <h3>💾 数据导出</h3>
+                    <button id="btn-export" class="btn btn-secondary btn-block">导出历史数据 (JSON)</button>
+                    <button id="btn-export-csv" class="btn btn-secondary btn-block">导出指标 (CSV)</button>
+                </div>
+            </aside>
+        </div>
+    </div>
+
+    <div id="toast-container" class="toast-container"></div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
